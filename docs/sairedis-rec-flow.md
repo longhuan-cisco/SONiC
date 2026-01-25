@@ -2,6 +2,43 @@
 
 This document explains the end-to-end flow of how `sairedis.rec` gets written as part of the SONiC SAI SDK architecture.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture Diagram](#architecture-diagram)
+- [Orchagent ↔ Syncd Communication Architecture](#orchagent--syncd-communication-architecture)
+  - [How ProducerTable/ConsumerTable Works](#how-producertableconsumertable-works)
+  - [Queue Summary](#queue-summary)
+- [Who Writes sairedis.rec?](#who-writes-sairedisrec)
+- [Communication Modes: Sync vs Async](#communication-modes-sync-vs-async)
+  - [Available Modes](#available-modes)
+  - [The Critical Difference: waitForResponse()](#the-critical-difference-waitforresponse)
+  - [Visual Flow Comparison](#visual-flow-comparison)
+  - [Recording Implications](#recording-implications)
+  - [Important: Syncd Always Writes Responses](#important-syncd-always-writes-responses)
+  - [Mode Configuration](#mode-configuration)
+  - [Trade-offs](#trade-offs)
+- [When Does Recording Happen?](#when-does-recording-happen)
+  - [1. Configuration Phase (Orchagent Startup)](#1-configuration-phase-orchagent-startup)
+  - [2. Recording Phase (Runtime)](#2-recording-phase-runtime)
+  - [3. Actual File Write](#3-actual-file-write)
+- [Threading Model and Performance](#threading-model-and-performance)
+  - [Recording Happens on Main Thread](#recording-happens-on-main-thread)
+  - [Why Synchronous Recording?](#why-synchronous-recording)
+  - [Blocking Cost per Recording](#blocking-cost-per-recording)
+  - [Why It's Usually Acceptable](#why-its-usually-acceptable)
+  - [When Recording Could Be A Problem](#when-recording-could-be-a-problem)
+  - [Disabling Recording for Performance](#disabling-recording-for-performance)
+- [Recording Format](#recording-format)
+  - [Operation Codes](#operation-codes)
+  - [Example Recording (Sync Mode)](#example-recording-sync-mode)
+- [Command-Line Configuration](#command-line-configuration)
+- [Log Rotation](#log-rotation)
+- [Replay Functionality (SaiPlayer)](#replay-functionality-saiplayer)
+- [Key Source Files](#key-source-files)
+- [Important Notes](#important-notes)
+- [Debugging Tips](#debugging-tips)
+
 ## Overview
 
 `sairedis.rec` is a recording file that captures **all SAI API calls** made by orchagent through the sairedis library. It serves as a comprehensive audit trail for debugging, troubleshooting hardware configuration issues, and replay testing.
@@ -9,64 +46,62 @@ This document explains the end-to-end flow of how `sairedis.rec` gets written as
 ## Architecture Diagram
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                              ORCHAGENT                                      │
-│   (Network Orchestration Agent - translates APPL_DB to SAI calls)          │
-└────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    │ SAI API calls (create, remove, set, get)
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                    LIBSAIREDIS (Client SAI Library)                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    RedisRemoteSaiInterface                           │   │
-│  │  • Intercepts all SAI API calls                                      │   │
-│  │  • Serializes object attributes                                      │   │
-│  │  • Records to sairedis.rec via Recorder class    ──────────────────────────┐
-│  │  • Sends commands to Redis ASIC_STATE table                          │   │ │
-│  └─────────────────────────────────────────────────────────────────────┘   │ │
-└────────────────────────────────────────────────────────────────────────────┘ │
-                                    │                                          │
-                                    │ Redis/ZMQ                                │
-                                    ▼                                          │
-┌────────────────────────────────────────────────────────────────────────────┐ │
-│                         REDIS (ASIC_STATE_DB)                               │ │
-│   Stores SAI object state and serves as IPC between orchagent & syncd      │ │
-└────────────────────────────────────────────────────────────────────────────┘ │
-                                    │                                          │
-                                    │ SelectableChannel polling               │
-                                    ▼                                          │
-┌────────────────────────────────────────────────────────────────────────────┐ │
-│                              SYNCD                                          │ │
-│   • Receives SAI commands from Redis                                        │ │
-│   • Translates VID (Virtual ID) ↔ RID (Real ID)                            │ │
-│   • Calls actual hardware SAI SDK via VendorSai                            │ │
-└────────────────────────────────────────────────────────────────────────────┘ │
-                                    │                                          │
-                                    │ SAI API (vendor-specific)               │
-                                    ▼                                          │
-┌────────────────────────────────────────────────────────────────────────────┐ │
-│                     HARDWARE SAI SDK (VendorSai)                            │ │
-│   (Broadcom, Mellanox, Marvell, etc.)                                       │ │
-└────────────────────────────────────────────────────────────────────────────┘ │
-                                    │                                          │
-                                    │                                          │
-                                    ▼                                          │
-┌────────────────────────────────────────────────────────────────────────────┐ │
-│                          ASIC HARDWARE                                      │ │
-│                  (Network switching silicon)                                │ │
-└────────────────────────────────────────────────────────────────────────────┘ │
-                                                                               │
-                                                                               │
-                ┌──────────────────────────────────────────────────────────────┘
-                │
-                ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                          sairedis.rec                                       │
-│   • Timestamp-prefixed log of all SAI operations                           │
-│   • Format: YYYY-MM-DD.HH:MM:SS.microseconds|opcode|data                   │
-│   • Located in configurable directory (default: current directory)         │
-└────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                           ORCHAGENT                             │
+│   (Network Orchestration Agent - translates APPL_DB to SAI)     │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               │ SAI API calls (create, remove, set, get)
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                 LIBSAIREDIS (Client SAI Library)                │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                 RedisRemoteSaiInterface                   │  │
+│  │  • Intercepts all SAI API calls                           │  │
+│  │  • Serializes object attributes                           │  │
+│  │  • Records to sairedis.rec via Recorder class ──────────────────┐
+│  │  • Sends commands to Redis ASIC_STATE table               │  │  │
+│  └───────────────────────────────────────────────────────────┘  │  │
+└─────────────────────────────────────────────────────────────────┘  │
+                               │                                     │
+                               │ Redis/ZMQ                           │
+                               ▼                                     │
+┌─────────────────────────────────────────────────────────────────┐  │
+│                      REDIS (ASIC_STATE_DB)                      │  │
+│   Stores SAI object state and serves as IPC                     │  │
+└─────────────────────────────────────────────────────────────────┘  │
+                               │                                     │
+                               │ SelectableChannel polling           │
+                               ▼                                     │
+┌─────────────────────────────────────────────────────────────────┐  │
+│                           SYNCD                                 │  │
+│   • Receives SAI commands from Redis                            │  │
+│   • Translates VID (Virtual ID) ↔ RID (Real ID)                 │  │
+│   • Calls actual hardware SAI SDK via VendorSai                 │  │
+└─────────────────────────────────────────────────────────────────┘  │
+                               │                                     │
+                               │ SAI API (vendor-specific)           │
+                               ▼                                     │
+┌─────────────────────────────────────────────────────────────────┐  │
+│                  HARDWARE SAI SDK (VendorSai)                   │  │
+│             (Broadcom, Mellanox, Marvell, etc.)                 │  │
+└─────────────────────────────────────────────────────────────────┘  │
+                               │                                     │
+                               ▼                                     │
+┌─────────────────────────────────────────────────────────────────┐  │
+│                        ASIC HARDWARE                            │  │
+│                   (Network switching silicon)                   │  │
+└─────────────────────────────────────────────────────────────────┘  │
+                                                                     │
+                    ┌────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        sairedis.rec                             │
+│   • Timestamp-prefixed log of all SAI operations                │
+│   • Format: YYYY-MM-DD.HH:MM:SS.microseconds|opcode|data        │
+│   • Located in configurable directory (default: .)              │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Orchagent ↔ Syncd Communication Architecture
@@ -178,51 +213,48 @@ sai_status_t RedisRemoteSaiInterface::waitForResponse(sai_common_api_t api)
 ### Visual Flow Comparison
 
 ```
-                      SYNC MODE                              ASYNC MODE
-                      ─────────                              ──────────
-Orchagent             Orchagent
-    │                     │
-    ▼                     ▼
-create()              create()
-    │                     │
-    ▼                     ▼
-record request        record request
-    │                     │
-    ▼                     ▼
-send to Redis         send to Redis (buffered/pipelined)
-    │                     │
-    ▼                     ▼
-waitForResponse()     waitForResponse()
-    │                     │
-    ▼                     ▼
-┌─────────────────┐   ┌─────────────────┐
-│ m_syncMode=true │   │ m_syncMode=false│
-│                 │   │                 │
-│ BLOCK waiting   │   │ return SUCCESS  │◄── Fire and forget!
-│ for syncd...    │   │ immediately     │
-│                 │   │                 │
-│ record response │   │ (no recording)  │
-└────────┬────────┘   └─────────────────┘
-         │
-    [syncd processes, calls ASIC]
-         │
-         ▼
-    return REAL status
+         SYNC MODE                                     ASYNC MODE
+         ─────────                                     ──────────
+
+         Orchagent                                     Orchagent
+             │                                             │
+             ▼                                             ▼
+         create()                                      create()
+             │                                             │
+             ▼                                             ▼
+       record request                                record request
+             │                                             │
+             ▼                                             ▼
+       send to Redis                                 send to Redis (buffered/pipelined)
+             │                                             │
+             ▼                                             ▼
+     waitForResponse()                               waitForResponse()
+             │                                             │
+             ▼                                             ▼
+    ┌─────────────────┐                             ┌─────────────────┐
+    │ m_syncMode=true │                             │ m_syncMode=false│
+    │                 │                             │                 │
+    │ BLOCK waiting   │                             │ return SUCCESS  │◄── Fire and forget!
+    │ for syncd...    │                             │ immediately     │
+    │                 │                             │                 │
+    │ record response │                             │ (no recording)  │
+    └────────┬────────┘                             └─────────────────┘
+             │                                             │
+             ▼                                             ▼
+  [syncd processes, calls ASIC]                      return to caller
+             │                                       (assumes success)
+             ▼
+      return REAL status
 ```
 
 ### Recording Implications
 
-**Sync Mode sairedis.rec:**
-```
-2024-01-15.10:30:45.123456|c|SAI_OBJECT_TYPE_PORT:oid:0x1000000000001|SAI_PORT_ATTR_SPEED=100000
-2024-01-15.10:30:45.234567|C|SAI_STATUS_SUCCESS    ← Real response recorded
-```
+| Mode | Request Recorded? | Response Recorded? |
+|------|-------------------|-------------------|
+| Sync | Yes | Yes (real status) |
+| Async | Yes | **No** (assumed success) |
 
-**Async Mode sairedis.rec:**
-```
-2024-01-15.10:30:45.123456|c|SAI_OBJECT_TYPE_PORT:oid:0x1000000000001|SAI_PORT_ATTR_SPEED=100000
-                                                    ← NO response line!
-```
+See [Example Recording](#example-recording-sync-mode) for format details.
 
 ### Important: Syncd Always Writes Responses
 
@@ -520,13 +552,10 @@ It parses the recording file and re-executes all SAI operations, useful for:
 
 ## Important Notes
 
-1. **Client-Side Recording**: Recording happens in the orchagent process (via libsairedis), NOT in syncd
-2. **Thread Safety**: All recordings are mutex-protected for concurrent access
-3. **Performance**: Recording adds minimal overhead; each line is immediately flushed
-4. **Selective Recording**: Statistics operations can be disabled via `SAI_REDIS_SWITCH_ATTR_RECORD_STATS`
-5. **Skip Filtering**: Certain GET operations can be skipped via `SkipRecordAttrContainer`
-6. **Async Mode Limitation**: In async mode, response status is NOT recorded for create/set/remove operations
-7. **Syncd Always Responds**: Syncd writes responses regardless of client mode; async mode just doesn't read them
+1. **Recording Location**: Recording happens client-side in orchagent (via libsairedis), NOT in syncd
+2. **Selective Recording**: Stats operations can be disabled via `SAI_REDIS_SWITCH_ATTR_RECORD_STATS`
+3. **Skip Filtering**: Certain GET operations can be skipped via `SkipRecordAttrContainer` class
+4. **File Permissions**: Recording directory must be writable by orchagent process
 
 ## Debugging Tips
 
