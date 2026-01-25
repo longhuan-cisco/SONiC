@@ -6,7 +6,7 @@
 # 1. Clones source repositories
 # 2. Scans specified branches (supports glob patterns)
 # 3. Recursively finds markdown files in source directories
-# 4. Copies them to target directory (flattened to first layer)
+# 4. Compares with existing files and only copies if changed
 # 5. Handles conflicts by choosing the file with latest modification date
 # 6. Generates detailed commit messages with SHA-based source URLs
 #
@@ -114,6 +114,30 @@ get_file_info() {
     git log -1 --format="%ct %H" "origin/$branch" -- "$file_path" 2>/dev/null
 }
 
+# Check if source file content differs from target file
+file_needs_update() {
+    local repo_dir="$1"
+    local branch="$2"
+    local source_path="$3"
+    local target_path="$4"
+
+    # If target doesn't exist, it needs update
+    if [[ ! -f "$target_path" ]]; then
+        return 0  # true, needs update
+    fi
+
+    # Compare content
+    cd "$repo_dir"
+    local source_content=$(git show "origin/$branch:$source_path" 2>/dev/null)
+    local target_content=$(cat "$target_path" 2>/dev/null)
+
+    if [[ "$source_content" != "$target_content" ]]; then
+        return 0  # true, needs update
+    fi
+
+    return 1  # false, no update needed
+}
+
 # Main sync function
 sync_docs() {
     validate_config
@@ -204,23 +228,104 @@ sync_docs() {
         exit 0
     fi
 
-    log_info "Total files to sync: ${#file_sources[@]}"
+    log_info "Total files found in sources: ${#file_sources[@]}"
 
     # Prepare target directory
     local target_full_path="$TARGET_REPO_PATH/$TARGET_DIR"
     mkdir -p "$target_full_path"
 
-    # Copy files and build commit message
-    local commit_body="Add documentation files from source repositories to $TARGET_DIR/.
+    # Track changes
+    declare -a new_files=()
+    declare -a updated_files=()
+    declare -a unchanged_files=()
+    declare -A changed_file_sources  # Only files that changed
+
+    # Check each file for changes
+    for filename in $(echo "${!file_sources[@]}" | tr ' ' '\n' | sort); do
+        IFS='|' read -r repo_name branch file_path sha <<< "${file_sources[$filename]}"
+        local repo_dir="$WORK_DIR/$repo_name"
+        local target_file="$target_full_path/$filename"
+
+        if [[ ! -f "$target_file" ]]; then
+            new_files+=("$filename")
+            changed_file_sources[$filename]="${file_sources[$filename]}"
+        elif file_needs_update "$repo_dir" "$branch" "$file_path" "$target_file"; then
+            updated_files+=("$filename")
+            changed_file_sources[$filename]="${file_sources[$filename]}"
+        else
+            unchanged_files+=("$filename")
+        fi
+    done
+
+    # Report status
+    echo ""
+    log_info "=== Sync Status ==="
+    log_info "New files:       ${#new_files[@]}"
+    log_info "Updated files:   ${#updated_files[@]}"
+    log_info "Unchanged files: ${#unchanged_files[@]}"
+
+    # Check if any changes needed
+    local total_changes=$((${#new_files[@]} + ${#updated_files[@]}))
+
+    if [[ $total_changes -eq 0 ]]; then
+        log_success "All files are up to date. No changes needed."
+        echo ""
+        echo "=== Unchanged Files ==="
+        for f in "${unchanged_files[@]}"; do
+            echo "  ✓ $f"
+        done
+        exit 0
+    fi
+
+    # Show what will be changed
+    if [[ ${#new_files[@]} -gt 0 ]]; then
+        echo ""
+        echo "=== New Files ==="
+        for f in "${new_files[@]}"; do
+            echo "  + $f"
+        done
+    fi
+
+    if [[ ${#updated_files[@]} -gt 0 ]]; then
+        echo ""
+        echo "=== Updated Files ==="
+        for f in "${updated_files[@]}"; do
+            echo "  ~ $f"
+        done
+    fi
+
+    if [[ ${#unchanged_files[@]} -gt 0 ]]; then
+        echo ""
+        echo "=== Unchanged Files (skipped) ==="
+        for f in "${unchanged_files[@]}"; do
+            echo "  ✓ $f"
+        done
+    fi
+
+    # Copy changed files and build commit message
+    local commit_body="Sync documentation files from source repositories to $TARGET_DIR/.
 For files appearing in multiple branches, the version with the latest
 modification date was selected.
 
+"
+
+    if [[ ${#new_files[@]} -gt 0 ]]; then
+        commit_body+="New files added: ${#new_files[@]}
+"
+    fi
+
+    if [[ ${#updated_files[@]} -gt 0 ]]; then
+        commit_body+="Files updated: ${#updated_files[@]}
+"
+    fi
+
+    commit_body+="
 Source details for each synced file:
 "
     local file_num=1
 
-    for filename in $(echo "${!file_sources[@]}" | tr ' ' '\n' | sort); do
-        IFS='|' read -r repo_name branch file_path sha <<< "${file_sources[$filename]}"
+    for filename in $(echo "${!changed_file_sources[@]}" | tr ' ' '\n' | sort); do
+        IFS='|' read -r repo_name branch file_path sha <<< "${changed_file_sources[$filename]}"
         local repo_dir="$WORK_DIR/$repo_name"
 
         # Get the repo URL for commit message (extract from SOURCE_REPOS)
@@ -234,6 +339,15 @@ Source details for each synced file:
             fi
         done
 
+        # Determine if new or updated
+        local change_type="updated"
+        for nf in "${new_files[@]}"; do
+            if [[ "$nf" == "$filename" ]]; then
+                change_type="new"
+                break
+            fi
+        done
+
         # Copy file
         if [[ "$DRY_RUN" != "true" ]]; then
             cd "$repo_dir"
@@ -242,7 +356,7 @@ Source details for each synced file:
 
         # Build commit message entry
         commit_body+="
-$file_num. $filename
+$file_num. $filename [$change_type]
    - Source branch: $branch"
 
         # Add conflict info if applicable
@@ -278,18 +392,15 @@ $file_num. $filename
 
 $commit_body" > "$commit_msg_file"
 
-    log_success "Files synced to: $target_full_path"
-    log_info "Commit message saved to: $commit_msg_file"
-
+    echo ""
     if [[ "$DRY_RUN" == "true" ]]; then
         log_warn "DRY RUN - no files were actually copied"
         echo ""
         echo "=== Commit Message Preview ==="
         cat "$commit_msg_file"
     else
-        echo ""
-        echo "=== Files Synced ==="
-        ls -la "$target_full_path"/*.md 2>/dev/null || true
+        log_success "Files synced to: $target_full_path"
+        log_info "Commit message saved to: $commit_msg_file"
         echo ""
         echo "=== Commit Message ==="
         cat "$commit_msg_file"
