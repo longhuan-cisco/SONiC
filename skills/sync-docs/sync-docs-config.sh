@@ -52,6 +52,18 @@ SOURCE_REPOS=(
 )
 
 # ==============================================================================
+# EXCLUDE BRANCHES
+# ==============================================================================
+# Branches to exclude from syncing (exact match, one per line)
+# These branches contain initial/deprecated versions superseded by other branches
+
+EXCLUDE_BRANCHES=(
+    # Initial version branches - superseded by review branches
+    "claude/asic-port-state-lifecycle-T1atF"    # superseded by claude/review-sai-port-docs-hGhuz
+    "claude/document-oper-status-flow-8rVxS"    # superseded by claude/review-oper-status-docs-9rOg5
+)
+
+# ==============================================================================
 # OPTIONAL SETTINGS
 # ==============================================================================
 

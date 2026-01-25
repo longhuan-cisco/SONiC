@@ -73,6 +73,17 @@ clone_repo() {
     cd "$clone_dir" && git fetch --all 2>/dev/null
 }
 
+# Check if branch is in exclude list
+is_branch_excluded() {
+    local branch="$1"
+    for excluded in "${EXCLUDE_BRANCHES[@]}"; do
+        if [[ "$branch" == "$excluded" ]]; then
+            return 0  # true, is excluded
+        fi
+    done
+    return 1  # false, not excluded
+}
+
 # Get branches matching patterns
 get_matching_branches() {
     local repo_dir="$1"
@@ -83,6 +94,12 @@ get_matching_branches() {
     local all_branches=$(git branch -r | sed 's/origin\///' | tr -d ' ')
 
     for branch in $all_branches; do
+        # Skip excluded branches
+        if is_branch_excluded "$branch"; then
+            log_info "    Skipping excluded branch: $branch"
+            continue
+        fi
+
         for pattern in "${patterns[@]}"; do
             # Handle glob patterns
             if [[ "$branch" == $pattern ]]; then
