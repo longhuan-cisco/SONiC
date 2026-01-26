@@ -7,6 +7,49 @@ References (optional):
 - `doc/media-settings/Media-based-Port-settings.md` (original HLD-style doc)
 - `doc/port-si/Port_SI_Per_Speed.md` (per-lane-speed SI enhancements)
 
+## Table of contents
+
+- [Problem statement and motivation](#problem-statement-and-motivation)
+- [Key concepts / terminology](#key-concepts--terminology)
+- [Architecture overview (end-to-end)](#architecture-overview-end-to-end)
+  - [Event flow diagram](#event-flow-diagram)
+  - [Key selection diagram (JSON lookup)](#key-selection-diagram-json-lookup)
+- [Code pointers (where to read first)](#code-pointers-where-to-read-first)
+  - [xcvrd (sonic-platform-daemons)](#xcvrd-sonic-platform-daemons)
+  - [PortsOrch (sonic-swss)](#portsorch-sonic-swss)
+  - [SAI headers (SAI repo)](#sai-headers-sai-repo)
+- [Runtime file location and load behavior](#runtime-file-location-and-load-behavior)
+- [How `xcvrd` builds the lookup key](#how-xcvrd-builds-the-lookup-key)
+  - [`vendor_key`](#vendor_key)
+  - [`media_key`](#media_key)
+  - [`lane_speed_key` (per-speed selection)](#lane_speed_key-per-speed-selection)
+  - [`medium_lane_speed_key` (copper/optical shortcut)](#medium_lane_speed_key-copperoptical-shortcut)
+- [`media_settings.json` structure and lookup behavior](#media_settingsjson-structure-and-lookup-behavior)
+  - [Global vs per-port selection](#global-vs-per-port-selection)
+  - [Matching a settings entry within a port block](#matching-a-settings-entry-within-a-port-block)
+  - [Per-speed settings (lane_speed_key hierarchy)](#per-speed-settings-lane_speed_key-hierarchy)
+  - [Breakout (`subport`) and lane slicing](#breakout-subport-and-lane-slicing)
+- [How `xcvrd` publishes to DB](#how-xcvrd-publishes-to-db)
+  - [APPL_DB `PORT_TABLE`](#appl_db-port_table)
+  - [Field formatting rules (important for SerDes fields)](#field-formatting-rules-important-for-serdes-fields)
+  - [STATE_DB gating: `NPU_SI_SETTINGS_SYNC_STATUS`](#state_db-gating-npu_si_settings_sync_status)
+- [How PortsOrch programs SerDes (SAI object lifecycle)](#how-portsorch-programs-serdes-sai-object-lifecycle)
+  - [Parsing PORT_TABLE fields](#parsing-port_table-fields)
+  - [Mapping to SAI Port SerDes attributes](#mapping-to-sai-port-serdes-attributes)
+  - [Applying settings: remove + recreate Port SerDes object](#applying-settings-remove--recreate-port-serdes-object)
+  - [Link training interaction (common debug gotcha)](#link-training-interaction-common-debug-gotcha)
+- [Custom SerDes attributes](#custom-serdes-attributes)
+  - [In `media_settings.json`](#in-media_settingsjson)
+  - [What `xcvrd` publishes](#what-xcvrd-publishes)
+  - [How PortsOrch forwards it to SAI](#how-portsorch-forwards-it-to-sai)
+- [Debugging checklist (dev / field triage)](#debugging-checklist-dev--field-triage)
+  - [1) Confirm `media_settings.json` is loaded](#1-confirm-media_settingsjson-is-loaded)
+  - [2) Confirm `xcvrd` resolved settings and published to APPL_DB](#2-confirm-xcvrd-resolved-settings-and-published-to-appl_db)
+  - [3) Confirm PortsOrch consumed the fields and applied SerDes](#3-confirm-portsorch-consumed-the-fields-and-applied-serdes)
+  - [4) If settings publish but don’t take effect](#4-if-settings-publish-but-dont-take-effect)
+  - [5) Force a re-notify (when debugging)](#5-force-a-re-notify-when-debugging)
+- [Appendix: SI-related PORT_TABLE keys and SAI mapping (current PortsOrch)](#appendix-si-related-port_table-keys-and-sai-mapping-current-portsorch)
+
 ## Problem statement and motivation
 
 Different optics/DACs can require different ASIC SerDes/SI settings (TX FIR taps, pre-emphasis, polarity, vendor-private knobs, etc.) for acceptable BER/CRC behavior. These settings often depend on:
@@ -378,7 +421,9 @@ If link training is enabled on a port, PortsOrch will **cache** incoming SerDes 
 
 Implementation: `orchagent/portsorch.cpp` (look for “Save port ... serdes attributes for LT” and “Restore serdes attributes when LT is transitioned from ON to OFF”).
 
-## Custom SerDes attributes (CUSTOM:… → custom_serdes_attrs → SAI JSON)
+## Custom SerDes attributes
+
+This path supports vendor/private SerDes controls using the flow `CUSTOM:*` (in `media_settings.json`) → `custom_serdes_attrs` (in `APPL_DB` `PORT_TABLE`) → `SAI_PORT_SERDES_ATTR_CUSTOM_COLLECTION` (JSON payload passed to the vendor SAI SDK).
 
 This path is useful for vendor/private SerDes controls that don’t map cleanly to standard SAI attributes.
 
